@@ -7,7 +7,6 @@ import logging
 import scipy.ndimage as ndimage
 import pathlib
 from pytom_tm.tmjob import TMJob
-from pytom_tm.mask import spherical_mask
 from pytom_tm.angles import get_angle_list, convert_euler
 from pytom_tm.dataclass import RelionTiltSeriesMetaData
 from pytom_tm.io import read_mrc
@@ -343,9 +342,12 @@ def extract_particles(
         )
         cut_off = 0
 
-    # mask for iteratively selecting peaks
-    cut_box = int(particle_radius_px) * 2 + 1
-    cut_mask = (spherical_mask(cut_box, particle_radius_px, cut_box // 2) == 0) * 1
+    # suppression half-box size for non-maximum suppression (NMS)
+    # The original code zeros out a cube of side (2 * particle_radius_px + 1)
+    # centered on each accepted peak (because the smoothed spherical_mask is
+    # nonzero everywhere within the cut_box). So suppression uses L-infinity
+    # (Chebyshev) distance <= particle_radius_px.
+    suppression_half_box = int(particle_radius_px)
 
     # data for star file
     pixel_size = job.voxel_size
@@ -359,52 +361,88 @@ def extract_particles(
     data = []
     scores = []
 
-    for _ in tqdm(range(n_particles)):
-        ind = np.unravel_index(np.nanargmax(score_volume), score_volume.shape)
+    # --- Pre-sorted candidate approach for fast extraction ---
+    # Instead of calling np.nanargmax on the full volume for each particle
+    # (O(n_particles * volume_size)), we find all candidates above cut_off once,
+    # sort them, and iterate with distance-based suppression.
 
-        lcc_max = score_volume[ind]
+    # Find all voxels above cut_off that are not NaN
+    candidate_mask = score_volume > cut_off
+    candidate_mask &= ~np.isnan(score_volume)
+    candidate_indices = np.argwhere(candidate_mask)  # (N, 3) array of [z, y, x]
 
-        if lcc_max <= cut_off or np.isnan(lcc_max):
-            break
+    if len(candidate_indices) > 0:
+        # Get scores for all candidates and sort descending
+        candidate_scores = score_volume[
+            candidate_indices[:, 0],
+            candidate_indices[:, 1],
+            candidate_indices[:, 2],
+        ]
+        sort_order = np.argsort(candidate_scores)[::-1]
+        candidate_indices = candidate_indices[sort_order]
+        candidate_scores = candidate_scores[sort_order]
 
-        scores.append(lcc_max)
+        # Accepted peaks stored as numpy array for vectorized distance checks
+        accepted_peaks = np.empty((n_particles, 3), dtype=np.float64)
+        n_accepted = 0
 
-        # According to https://www.ccpem.ac.uk/user_help/rotation_conventions.php
-        # relion uses clockwise ZYZ. The -1 multiplication is needed because we use
-        # anti-clockwise angles.,
-        rotation = convert_euler(
-            [-1 * a for a in angle_list[int(angle_volume[ind])]],
-            order_in="ZXZ",
-            order_out="ZYZ",
-            degrees_in=False,
-            degrees_out=True,
+        logging.info(
+            f"Found {len(candidate_indices)} candidate voxels above cut-off, "
+            f"selecting up to {n_particles} particles with NMS"
         )
 
-        location = [i + o for i, o in zip(job.search_origin, ind)]
+        for ci in tqdm(range(len(candidate_indices)), desc="Extracting particles"):
+            if n_accepted >= n_particles:
+                break
 
-        data.append(
-            (
-                location[0],  # CoordinateX
-                location[1],  # CoordinateY
-                location[2],  # CoordinateZ
-                rotation[0],  # AngleRot
-                rotation[1],  # AngleTilt
-                rotation[2],  # AnglePsi
-                lcc_max,  # LCCmax
-                cut_off,  # Extraction cut off
-                sigma,  # Add sigma of template matching search, LCCmax/sigma = SNR
-                pixel_size,  # DetectorPixelSize
-                tomogram_id,  # MicrographName
+            ind = tuple(candidate_indices[ci])
+            lcc_max = float(candidate_scores[ci])
+
+            # Check suppression: is this candidate inside the exclusion cube
+            # of any accepted peak? (L-infinity distance <= particle_radius_px)
+            if n_accepted > 0:
+                diff = np.abs(
+                    accepted_peaks[:n_accepted]
+                    - candidate_indices[ci].astype(np.float64)
+                )
+                if np.any(np.all(diff <= suppression_half_box, axis=1)):
+                    continue
+
+            scores.append(lcc_max)
+
+            accepted_peaks[n_accepted] = candidate_indices[ci]
+            n_accepted += 1
+
+            # According to https://www.ccpem.ac.uk/user_help/rotation_conventions.php
+            # relion uses clockwise ZYZ. The -1 multiplication is needed because we use
+            # anti-clockwise angles.,
+            rotation = convert_euler(
+                [-1 * a for a in angle_list[int(angle_volume[ind])]],
+                order_in="ZXZ",
+                order_out="ZYZ",
+                degrees_in=False,
+                degrees_out=True,
             )
-        )
 
-        # box out the particle
-        start = [i - particle_radius_px for i in ind]
-        score_volume[
-            start[0] : start[0] + cut_box,
-            start[1] : start[1] + cut_box,
-            start[2] : start[2] + cut_box,
-        ] *= cut_mask
+            location = [i + o for i, o in zip(job.search_origin, ind)]
+
+            data.append(
+                (
+                    location[0],  # CoordinateX
+                    location[1],  # CoordinateY
+                    location[2],  # CoordinateZ
+                    rotation[0],  # AngleRot
+                    rotation[1],  # AngleTilt
+                    rotation[2],  # AnglePsi
+                    lcc_max,  # LCCmax
+                    cut_off,  # Extraction cut off
+                    sigma,  # Add sigma of template matching search, LCCmax/sigma = SNR
+                    pixel_size,  # DetectorPixelSize
+                    tomogram_id,  # MicrographName
+                )
+            )
+    else:
+        logging.info("No candidates found above cut-off.")
 
     output = pd.DataFrame(
         data,
