@@ -1,26 +1,30 @@
 from __future__ import annotations
-from packaging import version
-import pathlib
-import warnings
+
 import copy
 import itertools as itt
-import numpy as np
-import numpy.typing as npt
 import json
 import logging
-from scipy.fft import next_fast_len, rfftn, irfftn
-from pytom_tm.angles import get_angle_list
-from pytom_tm.matching import TemplateMatchingGPU
-from pytom_tm.weights import (
-    create_wedge,
-    power_spectrum_profile,
-    profile_to_weighting,
-    create_gaussian_band_pass,
-)
-from pytom_tm.io import read_mrc_meta_data, read_mrc, write_mrc, UnequalSpacingError
-from pytom_tm.json import CustomJSONEncoder, CustomJSONDecoder
-from pytom_tm.dataclass import CtfData, TiltSeriesMetaData, RelionTiltSeriesMetaData
+import pathlib
+import warnings
+
+import numpy as np
+import numpy.typing as npt
+from packaging import version
+from scipy.fft import irfftn, next_fast_len, rfftn
+
 from pytom_tm import __version__ as PYTOM_TM_VERSION
+from pytom_tm.angles import get_angle_list
+from pytom_tm.dataclass import CtfData, RelionTiltSeriesMetaData, TiltSeriesMetaData
+from pytom_tm.io import UnequalSpacingError, read_mrc, read_mrc_meta_data, write_mrc
+from pytom_tm.json import CustomJSONDecoder, CustomJSONEncoder
+from pytom_tm.weights import (
+    create_gaussian_band_pass,
+    create_wedge,
+    estimate_whitening_filter,
+    profile_to_weighting,
+)
+
+logger = logging.getLogger(__name__)
 
 
 def load_json_to_tmjob(
@@ -383,6 +387,12 @@ class TMJob:
         self.template_shape = meta_data_template["shape"]
         self.mask_shape = meta_data_mask["shape"]
 
+        if len(set(self.template_shape)) != 1:
+            raise ValueError(
+                "Template is not cubic, all dimensions should be equal. "
+                f"Found template shape: {self.template_shape}."
+            )
+
         if self.template_shape != self.mask_shape:
             raise ValueError(
                 "Template and mask have a different shape in pixels. "
@@ -402,7 +412,7 @@ class TMJob:
                 or round(self.voxel_size, 3)
                 != round(meta_data_template["voxel_size"], 3)
             ):
-                logging.debug(
+                logger.debug(
                     f"provided {self.voxel_size} tomogram "
                     f"{meta_data_tomo['voxel_size']} "
                     f"template {meta_data_template['voxel_size']}"
@@ -427,7 +437,7 @@ class TMJob:
             x[0] if x is not None else 0 for x in (search_x, search_y, search_z)
         ]
         # Check if tomogram origin is valid
-        if all([0 <= x < y for x, y in zip(search_origin, self.tomo_shape)]):
+        if all(0 <= x < y for x, y in zip(search_origin, self.tomo_shape)):
             self.search_origin = search_origin
         else:
             raise ValueError("Invalid input provided for search origin of tomogram.")
@@ -448,7 +458,7 @@ class TMJob:
             end - start for end, start in zip(search_end, self.search_origin)
         ]
 
-        logging.debug(f"origin, size = {self.search_origin}, {self.search_size}")
+        logger.debug(f"origin, size = {self.search_origin}, {self.search_size}")
         self.tomogram_mask = tomogram_mask
         if tomogram_mask is not None:
             temp = read_mrc(tomogram_mask)
@@ -513,20 +523,18 @@ class TMJob:
             f"{self.tomo_id}_whitening_filter.npy"
         )
         if self.whiten_spectrum and not job_loaded_for_extraction:
-            logging.info("Estimating whitening filter...")
-            weights = 1 / np.sqrt(
-                power_spectrum_profile(
-                    read_mrc(self.tomogram)[
-                        self.search_origin[0] : self.search_origin[0]
-                        + self.search_size[0],
-                        self.search_origin[1] : self.search_origin[1]
-                        + self.search_size[1],
-                        self.search_origin[2] : self.search_origin[2]
-                        + self.search_size[2],
-                    ]
-                )
+            logger.info("Estimating whitening filter...")
+            patch_size = min(max(self.template_shape[0], 64), min(self.search_size))
+            _, weights = estimate_whitening_filter(
+                tomogram=read_mrc(self.tomogram)[
+                    self.search_origin[0] : self.search_origin[0] + self.search_size[0],
+                    self.search_origin[1] : self.search_origin[1] + self.search_size[1],
+                    self.search_origin[2] : self.search_origin[2] + self.search_size[2],
+                ],
+                ts_metadata=self.ts_metadata,
+                patch_size=patch_size,
+                voxel_size=self.voxel_size,
             )
-            weights /= weights.max()  # scale to 1
             np.save(self.whitening_filter, weights)
 
         # phase randomization options
@@ -895,6 +903,8 @@ class TMJob:
             angle map), when no volumes are returned the output consists of a dictionary
             with search statistics
         """
+        from pytom_tm.matching import TemplateMatchingGPU
+
         tomo = read_mrc(self.tomogram)
         fast_tomo = np.zeros(
             tuple([next_fast_len(s, real=True) for s in tomo.shape]),
@@ -924,11 +934,11 @@ class TMJob:
             # TODO: make sure this doesn't lead to weird race conditions
             for ctf, defocus_shift in zip(self.ts_metadata.ctf_data, defocus_offsets):
                 ctf.defocus = ctf.defocus + defocus_shift * 1e-10
-            logging.debug(
+            logger.debug(
                 "Patch center (nr. of voxels): "
                 f"{np.array_str(relative_patch_center_angstrom, precision=2)}"
             )
-            logging.debug(
+            logger.debug(
                 "Defocus values (um): "
                 f"{[round(ctf.defocus * 1e6, 2) for ctf in self.ts_metadata.ctf_data]}",
             )
@@ -958,7 +968,7 @@ class TMJob:
             cut_off_radius=1.0,
         ).astype(np.float32)
 
-        if logging.DEBUG >= logging.root.level:
+        if logger.isEnabledFor(logging.DEBUG):
             write_mrc(
                 self.output_dir.joinpath("template_psf.mrc"),
                 template_filter,
@@ -971,7 +981,7 @@ class TMJob:
             )
 
         # next fast fft len
-        logging.debug(
+        logger.debug(
             "Next fast fft shape: "
             f"{tuple([next_fast_len(s, real=True) for s in self.search_size])}"
         )
@@ -1040,8 +1050,8 @@ class TMJob:
         del tm  # delete the template matching plan
 
         # cast to correct dtype
+        # only cast score_volume for now, keep angle_volue as is
         score_volume = score_volume.astype(self.output_dtype)
-        angle_volume = angle_volume
 
         if return_volumes:
             return score_volume, angle_volume

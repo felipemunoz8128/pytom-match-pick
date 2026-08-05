@@ -1,9 +1,12 @@
-import pathlib
-import os
-from scipy.spatial.transform import Rotation
-import numpy as np
-import healpix as hp
 import logging
+import os
+import pathlib
+
+import healpix as hp
+import numpy as np
+from scipy.spatial.transform import Rotation
+
+logger = logging.getLogger(__name__)
 
 
 def angle_to_angle_list(
@@ -40,7 +43,7 @@ def angle_to_angle_list(
         nside += 1
     used_npix = hp.nside2npix(nside)
     used_angle_diff = (4 * np.pi / used_npix) ** 0.5 * (180 / np.pi)
-    logging.log(
+    logger.log(
         log_level, f"Using an angle difference of {used_angle_diff:.4f} for Z1 and X"
     )
     theta, phi = hp.pix2ang(nside, np.arange(used_npix))
@@ -54,7 +57,7 @@ def angle_to_angle_list(
     psi, used_psi_diff = np.linspace(
         0, 2 * np.pi, n_psi_angles, endpoint=False, retstep=True
     )
-    logging.log(
+    logger.log(
         log_level,
         f"Using an angle difference of {np.rad2deg(used_psi_diff):.4f} for Z2",
     )
@@ -87,7 +90,7 @@ def load_angle_list(
     with open(str(file_name)) as fstream:
         lines = fstream.readlines()
     angle_list = [tuple(map(float, x.strip().split(" "))) for x in lines]
-    if not all([len(a) == 3 for a in angle_list]):
+    if not all(len(a) == 3 for a in angle_list):
         raise ValueError(
             "Invalid angle file provided, each line should have 3 ZXZ Euler angles!"
         )
@@ -134,7 +137,7 @@ def get_angle_list(
     except (ValueError, TypeError):
         angle_is_float = False
     if angle_is_float:
-        logging.log(
+        logger.log(
             log_level,
             f"Will generate an angle list with a maximum increment of {angle}",
         )
@@ -142,7 +145,7 @@ def get_angle_list(
     elif isinstance(angle, str | os.PathLike):
         possible_file_path = pathlib.Path(angle)
         if possible_file_path.exists() and possible_file_path.suffix == ".txt":
-            logging.log(
+            logger.log(
                 log_level,
                 "Custom file provided for the angular search. "
                 "Checking if it can be read...",

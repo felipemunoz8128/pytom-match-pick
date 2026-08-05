@@ -1,16 +1,17 @@
-import unittest
-import sys
-import pathlib
-import numpy as np
-import cupy as cp
 import logging
-from shutil import which
-from contextlib import redirect_stdout, redirect_stderr
+import pathlib
+import sys
+import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
+from shutil import which
 from tempfile import TemporaryDirectory
-from pytom_tm import entry_points
-from pytom_tm import io
+
+import cupy as cp
+import numpy as np
 from testing_utils import chdir
+
+from pytom_tm import entry_points, io
 
 # (command line function, function in entry_points file)
 ENTRY_POINTS_TO_TEST = [
@@ -26,7 +27,6 @@ try:
     from pytom_tm import plotting  # noqa: F401
 except RuntimeError:
     SKIP_PLOT = True
-    pass
 else:
     ENTRY_POINTS_TO_TEST.append(("pytom_estimate_roc.py", "estimate_roc"))
 
@@ -52,7 +52,7 @@ RELION5_TOMOGRAMS_STAR = pathlib.Path(__file__).parent.joinpath(
 RELION5_TOMOGRAM = TEST_DATA.joinpath("rec_tomo200528_107.mrc")
 
 # Initial logging level
-LOG_LEVEL = logging.getLogger().level
+LOG_LEVEL = logging.getLogger("pytom_tm").level
 
 
 def prep_argv(arg_dict):
@@ -196,7 +196,7 @@ class TestEntryPoints(unittest.TestCase):
         # should round correctly at 3 digits
         args["--input-voxel-size"] = "0.9999"
         args["--log-test"] = ""
-        with self.assertNoLogs(level=logging.WARNING):
+        with self.assertNoLogs(logger="pytom_tm", level=logging.WARNING):
             start(args)
         self.assertTrue(output.exists())
 
@@ -209,7 +209,7 @@ class TestEntryPoints(unittest.TestCase):
         # Don't try to invent pixels
         args["--output-voxel-size-angstrom"] = "2.0"
         args["--log-test"] = ""
-        with self.assertLogs(level="WARNING") as cm:
+        with self.assertLogs(logger="pytom_tm", level="WARNING") as cm:
             start(args)
         self.assertEqual(len(cm.output), 1)
         self.assertIn("voxel size does not match", cm.output[0])
@@ -328,7 +328,7 @@ class TestEntryPoints(unittest.TestCase):
         )
 
         # reset the log level after the entry point modified it
-        logging.basicConfig(level=LOG_LEVEL, force=True)
+        entry_points.configure_logging(LOG_LEVEL)
 
         # test providing invalid gpu indices
         n_devices = cp.cuda.runtime.getDeviceCount()
@@ -482,3 +482,117 @@ class TestEntryPoints(unittest.TestCase):
         # make sure we can run extraction
         start(extract_defaults)
         self.assertTrue((self.outputdir / f"{tomo_id}_particles.star").exists())
+
+    @unittest.mock.patch("pytom_tm.parallel.run_job_parallel")
+    def test_dropped_logging(self, mock_run):
+        # mock out the actuall running to speed up this test
+        mock_run.return_value = (np.random.rand(5, 5, 5), np.random.rand(5, 5, 5))
+        match_defaults = {
+            "-t": str(TEMPLATE),
+            "-m": str(MASK),
+            "-v": str(RELION5_TOMOGRAM),
+            "-d": str(self.outputdir),
+            "--voxel-size-angstrom": "1",
+            "--angular-search": "35",
+            "--tilt-angles": str(TILT_ANGLES),
+            "--per-tilt-weighting": "",
+            "--dose-accumulation": str(DOSE),
+            "--defocus": str(DEFOCUS_IMOD),
+            "--amplitude-contrast": "0.08",
+            "--spherical-aberration": "2.7",
+            "--voltage": "300",
+            "--tomogram-ctf-model": "phase-flip",
+            "-g": "0",
+            "--relion5-tomograms-star": str(RELION5_TOMOGRAMS_STAR),
+            "--log-test": "",
+        }
+        # make sure we at least log
+        arguments = match_defaults.copy()
+        with self.assertLogs(logger="pytom_tm", level="WARNING") as cm:
+            entry_points.match_template(prep_argv(arguments))
+        dropped_options = [
+            "--defocus",
+            "--amplitude-contrast",
+            "--voltage",
+            "--spherical-aberration",
+            "--tilt-angles",
+            "--per-tilt-weighting",
+            "--dose-accumulation",
+            "--voxel-size-angstrom",
+        ]
+        # test 1 line per dropped option
+        self.assertEqual(
+            len([i for i in cm.output if ("WARN" in i and "-" in i)]),
+            len(dropped_options),
+        )
+        logs = " ".join(cm.output)
+        for i in dropped_options:
+            self.assertIn(i, logs)
+
+        # repeat for warp-xml
+        # --tomogram-ctf-model is also dropped here: phase-flip correction is
+        # always on for warp metadata, same as per-tilt-weighting
+        warp_dropped_options = dropped_options + ["--tomogram-ctf-model"]
+        arguments = match_defaults.copy()
+        del arguments["--relion5-tomograms-star"]
+        arguments["--warp-xml-file"] = str(WARP_XML)
+        with self.assertLogs(logger="pytom_tm", level="WARNING") as cm:
+            entry_points.match_template(prep_argv(arguments))
+        self.assertEqual(
+            len([i for i in cm.output if ("WARN" in i and "-" in i)]),
+            len(warp_dropped_options),
+        )
+        logs = " ".join(cm.output)
+        for i in warp_dropped_options:
+            self.assertIn(i, logs)
+
+        # make sure we also log on shorthand
+        arguments = match_defaults.copy()
+        del arguments["--tilt-angles"]
+        arguments["-a"] = str(TILT_ANGLES)
+        with self.assertLogs(logger="pytom_tm", level="WARNING") as cm:
+            entry_points.match_template(prep_argv(arguments))
+        logs = " ".join(cm.output)
+        self.assertIn("--tilt-angles", logs)
+
+        # make sure we also log on abbreviations
+        arguments = match_defaults.copy()
+        del arguments["--per-tilt-weighting"]
+        arguments["--per-tilt"] = ""
+        with self.assertLogs(logger="pytom_tm", level="WARNING") as cm:
+            entry_points.match_template(prep_argv(arguments))
+        logs = " ".join(cm.output)
+        self.assertIn("--per-tilt-weighting", logs)
+
+        # make sure we log on both relion and warp xml
+        # TODO: is this actually intended behavior or should we error on this?
+        arguments = match_defaults.copy()
+        arguments["--warp-xml"] = str(WARP_XML)
+        with self.assertLogs(logger="pytom_tm", level="WARNING") as cm:
+            entry_points.match_template(prep_argv(arguments))
+        logs = " ".join(cm.output)
+        self.assertIn("--warp-xml-file", logs)
+
+        # make sure we log defocus handedness for relion but not for warp
+        # and phase shift for warp but not for relion
+        arguments = match_defaults.copy()
+        arguments["--defocus-handedness"] = "0"
+        arguments["--phase-shift"] = "1"
+        with self.assertLogs(logger="pytom_tm", level="WARNING") as cm:
+            entry_points.match_template(prep_argv(arguments))
+        logs = " ".join(cm.output)
+        self.assertIn("--defocus-handedness", logs)
+        self.assertNotIn("--phase-shift", logs)
+
+        # make sure we also log defocus handedness and phase shift for warp:
+        # defocus handedness is derived from AreAnglesInverted in the warp xml
+        arguments = match_defaults.copy()
+        arguments["--defocus-handedness"] = "0"
+        arguments["--phase-shift"] = "1"
+        del arguments["--relion5-tomograms-star"]
+        arguments["--warp-xml-file"] = str(WARP_XML)
+        with self.assertLogs(logger="pytom_tm", level="WARNING") as cm:
+            entry_points.match_template(prep_argv(arguments))
+        logs = " ".join(cm.output)
+        self.assertIn("--defocus-handedness", logs)
+        self.assertIn("--phase-shift", logs)

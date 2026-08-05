@@ -1,20 +1,23 @@
-from packaging import version
+import logging
 import math
-import pandas as pd
+import pathlib
+
 import numpy as np
 import numpy.typing as npt
-import logging
-import scipy.ndimage as ndimage
-import pathlib
-from pytom_tm.tmjob import TMJob
-from pytom_tm.mask import spherical_mask
-from pytom_tm.angles import get_angle_list, convert_euler
-from pytom_tm.dataclass import RelionTiltSeriesMetaData
-from pytom_tm.io import read_mrc
-from scipy.special import erfcinv
+import pandas as pd
+from packaging import version
+from scipy import ndimage
 from scipy.optimize import curve_fit
+from scipy.special import erfcinv
 from tqdm import tqdm
 
+from pytom_tm.angles import convert_euler, get_angle_list
+from pytom_tm.dataclass import RelionTiltSeriesMetaData
+from pytom_tm.io import read_mrc
+from pytom_tm.mask import spherical_mask
+from pytom_tm.tmjob import TMJob
+
+logger = logging.getLogger(__name__)
 
 plotting_available = False
 try:
@@ -140,7 +143,7 @@ def predict_tophat_mask(
     )
 
     if plotting_available and output_path is not None and create_plot:
-        fig, ax = plt.subplots()
+        _fig, ax = plt.subplots()
         ax.scatter(x_raw, y_raw, label="tophat", marker="o")
         ax.plot(x_raw, gauss(x_raw, *coeff_log), label="pred", color="tab:orange")
         ax.axvline(cut_off, color="gray", linestyle="dashed", label="cut-off")
@@ -251,7 +254,7 @@ def extract_particles(
     # apply tomogram mask if provided
     tomogram_mask = None
     if ignore_tomogram_mask:
-        logging.warning("Ignoring tomogram mask")
+        logger.warning("Ignoring tomogram mask")
     elif tomogram_mask_path is not None:
         tomogram_mask = read_mrc(tomogram_mask_path)
     elif job.tomogram_mask is not None:
@@ -285,7 +288,7 @@ def extract_particles(
         particle_radius_px = int((particle_diameter / 2) / job.voxel_size)
     elif job.particle_diameter is not None:
         particle_radius_px = int((job.particle_diameter / 2) / job.voxel_size)
-        logging.info(
+        logger.info(
             "No particle diameter was provided, so using the diameter "
             "specified previously to mask out areas around peaks. Take care for "
             "strongly elongated particles as it might prevent correct "
@@ -310,9 +313,9 @@ def extract_particles(
         # N**(-1) = erfc( theta / ( sigma * sqrt(2) ) ) / 2
         # we need to find theta (i.e. the cut off)
         cut_off = erfcinv((2 * n_false_positives) / search_space) * np.sqrt(2) * sigma
-        logging.info(f"cut off for particle extraction: {cut_off}")
+        logger.info(f"cut off for particle extraction: {cut_off}")
     elif cut_off < 0:
-        logging.warning(
+        logger.warning(
             "Provided extraction score cut-off is smaller than 0. Changing to 0 as "
             "that is smallest allowed value."
         )
@@ -435,7 +438,7 @@ def extract_particles(
         noise_amplitude = (search_space / (sigma * np.sqrt(2 * np.pi))) * hist_step
         y_background = noise_amplitude * np.exp(-(x_ext**2) / (2 * sigma**2))
 
-        fig, ax = plt.subplots()
+        _fig, ax = plt.subplots()
         ax.scatter(x, y, label="extracted", marker="o")
         ax.plot(x_ext, y_background, label="background", color="tab:orange")
         ax.axvline(cut_off, color="gray", linestyle="dashed", label="cut-off")
