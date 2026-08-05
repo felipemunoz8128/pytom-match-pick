@@ -1,32 +1,37 @@
 import argparse
-import sys
-import pathlib
 import logging
+import pathlib
+import sys
+from os import urandom
+
 import numpy as np
 import starfile
+
+from pytom_tm import configure_logging
 from pytom_tm.dataclass import TiltSeriesMetaData
 from pytom_tm.extract import extract_particles
 from pytom_tm.io import (
-    LargerThanZero,
-    write_mrc,
-    read_mrc_meta_data,
-    read_mrc,
+    BetweenZeroAndOne,
+    CheckDirExists,
     CheckFileExists,
     CheckListOfFilesExists,
+    LargerThanZero,
+    ParseDefocus,
+    ParseDoseFile,
+    ParseGPUIndices,
     ParseLogging,
-    CheckDirExists,
     ParseSearch,
     ParseTiltAngles,
-    ParseDoseFile,
-    ParseDefocus,
-    BetweenZeroAndOne,
-    ParseGPUIndices,
     parse_relion5_star_data,
     parse_warp_xml_data,
+    read_mrc,
+    read_mrc_meta_data,
+    write_mrc,
 )
-from pytom_tm.tmjob import load_json_to_tmjob
 from pytom_tm.merge_stars import merge_stars as merge_st
-from os import urandom
+from pytom_tm.tmjob import load_json_to_tmjob
+
+logger = logging.getLogger(__name__)
 
 
 def _parse_argv(argv=None):
@@ -36,7 +41,7 @@ def _parse_argv(argv=None):
 
 
 def pytom_create_mask(argv=None):
-    from pytom_tm.mask import spherical_mask, ellipsoidal_mask
+    from pytom_tm.mask import ellipsoidal_mask, spherical_mask
     # entry_point strings cannot use '\n' characters as this will break the website
     # snippet that displays the CLI help message
     # ---8<--- [start:create_mask_usage]
@@ -252,7 +257,7 @@ def pytom_create_template(argv=None):
     )
     args = parser.parse_args(argv)
     if not args.log_test:
-        logging.basicConfig(level=args.log, force=True)
+        configure_logging(args.log)
 
     # set input voxel size and give user warning if it does not match
     # with MRC annotation
@@ -262,7 +267,7 @@ def pytom_create_template(argv=None):
         if round(args.input_voxel_size_angstrom, 3) != round(
             input_meta_data["voxel_size"], 3
         ):
-            logging.warning(
+            logger.warning(
                 "Provided voxel size does not match voxel size annotated in input map."
             )
         map_spacing_angstrom = args.input_voxel_size_angstrom
@@ -295,7 +300,7 @@ def pytom_create_template(argv=None):
         output_box_size=args.box_size,
     ) * (-1 if args.invert else 1)
 
-    logging.debug(f"shape of template after processing is: {template.shape}")
+    logger.debug(f"shape of template after processing is: {template.shape}")
 
     write_mrc(
         output_path,
@@ -409,7 +414,7 @@ def estimate_roc(argv=None):
     # ---8<--- [end:estimate_roc_usage]
 
     args = parser.parse_args(argv)
-    logging.basicConfig(level=args.log, force=True)
+    configure_logging(args.log)
 
     template_matching_job = load_json_to_tmjob(args.job_file)
     # Set cut off to -1 to ensure the number of particles gets extracted
@@ -588,7 +593,7 @@ def extract_candidates(argv=None):
     # ---8<--- [end:extract_candidates_usage]
 
     args = parser.parse_args(argv)
-    logging.basicConfig(level=args.log, force=True)
+    configure_logging(args.log)
 
     # load job and extract particles from the volumes
     job = load_json_to_tmjob(args.job_file)
@@ -616,9 +621,9 @@ def extract_candidates(argv=None):
 
 
 def match_template(argv=None):
-    from pytom_tm.tmjob import TMJob
-    from pytom_tm.parallel import run_job_parallel
     from pytom_tm.dataclass import CtfData
+    from pytom_tm.parallel import run_job_parallel
+    from pytom_tm.tmjob import TMJob
 
     argv = _parse_argv(argv)
 
@@ -791,11 +796,13 @@ def match_template(argv=None):
         default=False,
         required=False,
         help="Flag to activate per-tilt-weighting, only makes sense if a file with all "
-        "tilt angles have been provided. In case not set, while a tilt angle file is "
+        "tilt angles has been provided. If not set while a tilt angle file is "
         "provided, the minimum and maximum tilt angle are used to create a binary "
         "wedge. The base functionality creates a fanned wedge where each tilt is "
         "weighted by cos(tilt_angle). If dose accumulation and CTF parameters are "
-        "provided these will all be incorporated in the tilt-weighting.",
+        "provided these will all be incorporated in the tilt-weighting. "
+        "Per-tilt-weighting is always on when --warp-xml-file or "
+        "--relion5-tomograms-star is used.",
     )
     filter_group.add_argument(
         "--voxel-size-angstrom",
@@ -888,7 +895,8 @@ def match_template(argv=None):
         "Not using this option is appropriate if the CTF was left uncorrected in "
         "the tomogram. Option 'phase-flip' : appropriate for IMOD's strip-based "
         "phase flipping or reconstructions generated with "
-        "novaCTF/3dctf.",
+        "novaCTF/3dctf. Phase-flip correction is always on when --warp-xml-file "
+        "is used.",
     )
     filter_group.add_argument(
         "--defocus-handedness",
@@ -905,7 +913,9 @@ def match_template(argv=None):
         "A value of 0 means no defocus gradient correction (default), 1 means "
         "correction assuming correct handedness (as specified in Pyle and "
         "Zianetti (2021)), -1 means the handedness will be inverted. If uncertain "
-        "better to leave off as an inverted correction might hamper results.",
+        "better to leave off as an inverted correction might hamper results. "
+        "Defocus handedness is set automatically when --warp-xml-file or "
+        "--relion5-tomograms-star is used.",
     )
     filter_group.add_argument(
         "--spectral-whitening",
@@ -963,7 +973,9 @@ def match_template(argv=None):
         help="Here, you can provide a Warp xml file that has the metadata "
         "for that tiltseries."
         "This xml metadata file will be in the tiltseries processing dir "
-        "eg. <cwd>/warp_tiltseries/)",
+        "eg. <cwd>/warp_tiltseries/). pytom-match-pick will fetch all the "
+        "tilt-series metadata from this file and overwrite all other metadata "
+        "options.",
     )
     device_group = parser.add_argument_group("Device control")
     device_group.add_argument(
@@ -987,8 +999,13 @@ def match_template(argv=None):
 
     # ---8<--- [end:match_template_usage]
 
+    # Add hidden argument to prevent logging override for logtests
+    parser.add_argument(
+        "--log-test", help=argparse.SUPPRESS, action="store_true", default=False
+    )
     args = parser.parse_args(argv)
-    logging.basicConfig(level=args.log, force=True)
+    if not args.log_test:
+        configure_logging(args.log)
 
     # set rng if not set
     if args.rng_seed is None:
@@ -1033,7 +1050,7 @@ def match_template(argv=None):
             )
             for defocus in args.defocus
         ]
-
+    dropped_args = []
     if args.relion5_tomograms_star is not None:
         voxel_size, ts_metadata = parse_relion5_star_data(
             args.relion5_tomograms_star,
@@ -1041,15 +1058,37 @@ def match_template(argv=None):
             phase_flip_correction=phase_flip_correction,
             phase_shift=args.phase_shift,
         )
+        dropped_args += [
+            "--defocus",
+            "--amplitude-contrast",
+            "--voltage",
+            "--spherical-aberration",
+            ("-a", "--tilt-angles"),
+            "--per-tilt-weighting",
+            "--warp-xml-file",
+            "--voxel-size-angstrom",
+            "--dose-accumulation",
+            "--defocus-handedness",
+        ]
 
     elif args.warp_xml_file is not None:
         voxel_size, ts_metadata = parse_warp_xml_data(
             args.warp_xml_file,
             args.tomogram,
-            phase_flip_correction=phase_flip_correction,
         )
-        # Replace is needed here to rerun the sanity checking
-        ts_metadata = ts_metadata.replace(defocus_handedness=args.defocus_handedness)
+        dropped_args += [
+            "--defocus",
+            "--amplitude-contrast",
+            "--voltage",
+            "--spherical-aberration",
+            ("-a", "--tilt-angles"),
+            "--per-tilt-weighting",
+            "--voxel-size-angstrom",
+            "--dose-accumulation",
+            "--phase-shift",
+            "--tomogram-ctf-model",
+            "--defocus-handedness",
+        ]
 
     else:
         if tilt_angles is None:
@@ -1066,6 +1105,24 @@ def match_template(argv=None):
             defocus_handedness=args.defocus_handedness,
             per_tilt_weighting=args.per_tilt_weighting,
         )
+
+    # Warn for dropped args, use new parser to deal with possible shorthand
+    check_input = argparse.ArgumentParser(
+        add_help=False, argument_default=argparse.SUPPRESS
+    )
+    for arg in dropped_args:
+        if isinstance(arg, tuple):
+            short, long = arg
+            check_input.add_argument(
+                short, long, action="store_const", const=f"{short}/{long}"
+            )
+        else:
+            check_input.add_argument(arg, action="store_const", const=f"{arg}")
+    # drop any input values that were not options
+    check_argv = [i for i in argv if "-" in i]
+    check_args, _ = check_input.parse_known_args(check_argv)
+    for val in vars(check_args).values():
+        logger.warning(f"The following input argument was ignored: {val}")
 
     if args.angular_search is None and args.particle_diameter is None:
         raise ValueError(
@@ -1179,6 +1236,6 @@ def merge_stars(argv=None):
     )
     args = parser.parse_args(argv)
     if not args.log_test:
-        logging.basicConfig(level=args.log, force=True)
+        configure_logging(args.log)
 
     merge_st(args.input_star_files, args.output_file, args.relion5_compat)

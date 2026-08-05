@@ -1,12 +1,14 @@
+import gc
+
 import cupy as cp
 import cupy.typing as cpt
 import numpy.typing as npt
 import voltools as vt
-import gc
-from cupyx.scipy.fft import rfftn, irfftn
+from cupyx.scipy.fft import irfftn, rfftn
 from tqdm import tqdm
+
 from pytom_tm.correlation import normalise
-from pytom_tm.template import phase_randomize_template
+from pytom_tm.template import _phase_randomize_template
 
 
 class TemplateMatchingPlan:
@@ -193,7 +195,9 @@ class TemplateMatchingGPU:
 
         # create a 'random noise' version of the template
         shuffled_template = (
-            phase_randomize_template(template, rng_seed) if noise_correction else None
+            _phase_randomize_template(template, mask, seed=rng_seed)
+            if noise_correction
+            else None
         )
 
         self.plan = TemplateMatchingPlan(

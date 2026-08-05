@@ -22,11 +22,11 @@ jobs:
         working-directory: ./docs/tutorials
     steps:
       - name: Pull code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       - name: Install dependencies, code, and list everything
         working-directory: ./
         run: |
-          conda install -y -c conda-forge python=3 cupy cuda-version=11.8 curl unzip
+          conda install -y -c conda-forge python=3 cupy cuda-version=11.8 curl unzip gcc
           python -m pip install coverage mdextractor #mdextractor is new and might need to be replaced later
           python -m pip install .[all]
           conda list

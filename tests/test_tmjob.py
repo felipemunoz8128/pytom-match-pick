@@ -1,29 +1,30 @@
-import unittest
 import pathlib
+import unittest
 from dataclasses import asdict
+from tempfile import NamedTemporaryFile, TemporaryDirectory
+
+import mrcfile
 import numpy as np
 import voltools as vt
-import mrcfile
-from tempfile import TemporaryDirectory, NamedTemporaryFile
-from pytom_tm.mask import spherical_mask
-from pytom_tm.angles import angle_to_angle_list
-from pytom_tm.tmjob import TMJob, TMJobError, load_json_to_tmjob, get_defocus_offsets
-from pytom_tm.io import (
-    read_mrc,
-    write_mrc,
-    UnequalSpacingError,
-    parse_relion5_star_data,
-)
-from pytom_tm.dataclass import CtfData, TiltSeriesMetaData, RelionTiltSeriesMetaData
-from pytom_tm.extract import extract_particles
 from testing_utils import (
-    CTF_PARAMS,
     ACCUMULATED_DOSE,
+    CTF_PARAMS,
     TILT_ANGLES,
     chdir,
     make_relion5_tomo_stars,
 )
 
+from pytom_tm.angles import angle_to_angle_list
+from pytom_tm.dataclass import CtfData, RelionTiltSeriesMetaData, TiltSeriesMetaData
+from pytom_tm.extract import extract_particles
+from pytom_tm.io import (
+    UnequalSpacingError,
+    parse_relion5_star_data,
+    read_mrc,
+    write_mrc,
+)
+from pytom_tm.mask import spherical_mask
+from pytom_tm.tmjob import TMJob, TMJobError, get_defocus_offsets, load_json_to_tmjob
 
 TOMO_SHAPE = (100, 107, 59)
 TEMPLATE_SIZE = 13
@@ -43,6 +44,8 @@ TEST_EXTRACTION_MASK_INSIDE = TEST_DATA_DIR.joinpath("extraction_mask_inside.mrc
 TEST_EXTRACTION_MASK_INT8 = TEST_DATA_DIR.joinpath("extraction_mask_int8.mrc")
 TEST_TEMPLATE = TEST_DATA_DIR.joinpath("template.mrc")
 TEST_TEMPLATE_UNEQUAL_SPACING = TEST_DATA_DIR.joinpath("template_unequal_spacing.mrc")
+TEST_TEMPLATE_NOT_CUBIC = TEST_DATA_DIR.joinpath("template_not_cubic.mrc")
+TEST_MASK_NOT_CUBIC = TEST_DATA_DIR.joinpath("mask_not_cubic.mrc")
 TEST_TEMPLATE_WRONG_VOXEL_SIZE = TEST_DATA_DIR.joinpath("template_voxel_error_test.mrc")
 TEST_MASK = TEST_DATA_DIR.joinpath("mask.mrc")
 TEST_MASK_WRONG_SIZE = TEST_DATA_DIR.joinpath("mask_wrong_size.mrc")
@@ -112,6 +115,17 @@ class TestTMJob(unittest.TestCase):
         write_mrc(TEST_MASK_WRONG_SIZE, mask_wrong_size, 1.0)
         write_mrc(TEST_TEMPLATE, template, 1.0)
         write_mrc(TEST_TEMPLATE_WRONG_VOXEL_SIZE, template, 1.5)
+        not_cubic_shape = (TEMPLATE_SIZE, TEMPLATE_SIZE, TEMPLATE_SIZE - 2)
+        write_mrc(
+            TEST_TEMPLATE_NOT_CUBIC,
+            np.zeros(not_cubic_shape, dtype=np.float32),
+            1.0,
+        )
+        write_mrc(
+            TEST_MASK_NOT_CUBIC,
+            np.zeros(not_cubic_shape, dtype=np.float32),
+            1.0,
+        )
         mrcfile.write(
             TEST_TEMPLATE_UNEQUAL_SPACING, template, voxel_size=(1.5, 1.0, 2.0)
         )
@@ -356,6 +370,22 @@ class TestTMJob(unittest.TestCase):
                 voxel_size=1.0,
                 tomogram_mask=TEST_WRONG_SIZE_TOMO_MASK,
             )
+        # Test non-cubic template
+        with self.assertRaisesRegex(
+            ValueError,
+            "not cubic",
+        ):
+            TMJob(
+                "0",
+                10,
+                TEST_TOMOGRAM,
+                TEST_TEMPLATE_NOT_CUBIC,
+                TEST_MASK_NOT_CUBIC,
+                TEST_DATA_DIR,
+                ts_metadata=TS_METADATA,
+                angle_increment=ANGULAR_SEARCH,
+                voxel_size=1.0,
+            )
         # Test template mask mismatch
         with self.assertRaisesRegex(
             ValueError,
@@ -468,7 +498,7 @@ class TestTMJob(unittest.TestCase):
             high_pass=100,
             whiten_spectrum=True,
         )
-        score, angle = job.start_job(0, return_volumes=True)
+        score, _angle = job.start_job(0, return_volumes=True)
         self.assertEqual(
             score.shape, job.tomo_shape, msg="TMJob with all options failed"
         )
@@ -486,7 +516,7 @@ class TestTMJob(unittest.TestCase):
             angle_increment=90.00,
             voxel_size=1.0,
         )
-        score, angle = job.start_job(0, return_volumes=True)
+        score, _angle = job.start_job(0, return_volumes=True)
         self.assertEqual(
             score.shape, job.tomo_shape, msg="TMJob with only wedge creation failed"
         )
@@ -505,7 +535,7 @@ class TestTMJob(unittest.TestCase):
             low_pass=10,
             high_pass=100,
         )
-        score, angle = job.start_job(0, return_volumes=True)
+        score, _angle = job.start_job(0, return_volumes=True)
         self.assertEqual(
             score.shape, job.tomo_shape, msg="TMJob with only band-pass failed"
         )
@@ -524,7 +554,7 @@ class TestTMJob(unittest.TestCase):
             voxel_size=1.0,
             whiten_spectrum=True,
         )
-        score, angle = job.start_job(0, return_volumes=True)
+        score, _angle = job.start_job(0, return_volumes=True)
         self.assertEqual(
             score.shape, job.tomo_shape, msg="TMJob with only whitening filter failed"
         )
@@ -542,20 +572,20 @@ class TestTMJob(unittest.TestCase):
             angle_increment=90.00,
             voxel_size=1.0,
             whiten_spectrum=True,
-            search_y=[10, 90],
+            search_z=[0, 30],
         )
         new_whitening_filter = np.load(TEST_WHITENING_FILTER)
         self.assertNotEqual(
             whitening_filter.shape,
             new_whitening_filter.shape,
-            msg="After reducing the search region along the largest dimension the "
-            "whitening filter should have less sampling points",
+            msg="After reducing the search region below the default estimation "
+            "patch size the whitening filter should have less sampling points",
         )
         self.assertEqual(
             new_whitening_filter.shape,
-            (max(job.search_size) // 2 + 1,),
+            (min(64, min(job.search_size)) // 2 + 1,),
             msg="The whitening filter does not have the expected size, it should be "
-            "equal (x // 2) + 1, where x is the largest dimension of the search box.",
+            "equal (x // 2) + 1, where x is min(64, smallest search box dimension).",
         )
 
         # TMJob with none of these weighting options is tested in all other runs
@@ -569,9 +599,9 @@ class TestTMJob(unittest.TestCase):
         )
 
         # check job loading and preventing whitening filter recalculation
-        with self.assertNoLogs(level="INFO"):
+        with self.assertNoLogs(logger="pytom_tm", level="INFO"):
             _ = load_json_to_tmjob(TEST_JOB_JSON_WHITENING, load_for_extraction=True)
-        with self.assertLogs(level="INFO") as cm:
+        with self.assertLogs(logger="pytom_tm", level="INFO") as cm:
             _ = load_json_to_tmjob(TEST_JOB_JSON_WHITENING, load_for_extraction=False)
         self.assertIn("Estimating whitening filter...", "".join(cm.output))
 
@@ -651,7 +681,7 @@ class TestTMJob(unittest.TestCase):
             scores, angles = job.start_job(0, return_volumes=True)
             write_mrc(data_dir / "tomogram_scores.mrc", scores, job.voxel_size)
             write_mrc(data_dir / "tomogram_angles.mrc", angles, job.voxel_size)
-            df, scores = extract_particles(
+            _df, scores = extract_particles(
                 job, 100, particle_diameter=10, create_plot=False
             )
             self.assertNotEqual(
@@ -853,19 +883,31 @@ class TestTMJob(unittest.TestCase):
         )
 
         # extract particles after running the job
-        df, scores = extract_particles(
+        _df, scores = extract_particles(
             self.job, 100, particle_diameter=10, create_plot=False
         )
         self.assertNotEqual(
             len(scores), 0, msg="Here we expect to get some annotations."
         )
 
+        # test for log if cutoff is negative
+        with self.assertLogs(logger="pytom_tm", level="WARNING") as cm:
+            _ = extract_particles(
+                self.job, 100, particle_diameter=10, create_plot=False, cut_off=-1
+            )
+        self.assertNotEqual(
+            len(scores), 0, msg="Here we expect to get some annotations."
+        )
+        self.assertIn("cut-off is smaller than 0", "".join(cm.output))
+
+        # test for particle diameter stuff
         with self.assertRaisesRegex(ValueError, "particle diameter"):
             _ = extract_particles(self.job, 100, create_plot=False)
         job = self.job.copy()
         job.particle_diameter = 10
-        with self.assertLogs(level="INFO") as cm:
-            _ = extract_particles(job, 100, create_plot=False)
+        with self.assertLogs(logger="pytom_tm", level="INFO") as cm:
+            _df, scores = extract_particles(job, 100, create_plot=False)
+
         self.assertIn("No particle diameter was provided,", "".join(cm.output))
 
         # extract particles in relion5 style
@@ -895,7 +937,7 @@ class TestTMJob(unittest.TestCase):
         self.assertNotIn("rec_", df_rel5["rlnTomoName"][0])
 
         # test extraction mask that does not cover the particle
-        df, scores = extract_particles(
+        _df, scores = extract_particles(
             self.job,
             5,
             100,
@@ -911,7 +953,7 @@ class TestTMJob(unittest.TestCase):
         # test if the extraction mask can be grabbed from the job instead
         job = self.job.copy()
         job.tomogram_mask = TEST_EXTRACTION_MASK_OUTSIDE
-        df, scores = extract_particles(
+        _df, scores = extract_particles(
             job,
             100,
             particle_diameter=10,
@@ -925,8 +967,8 @@ class TestTMJob(unittest.TestCase):
         )
         # test if all masks are ignored if ignore_tomogram_mask=True
         # and that a warning is raised
-        with self.assertLogs(level="WARNING") as cm:
-            df, scores = extract_particles(
+        with self.assertLogs(logger="pytom_tm", level="WARNING") as cm:
+            _df, scores = extract_particles(
                 job,
                 100,
                 particle_diameter=10,
@@ -949,7 +991,7 @@ class TestTMJob(unittest.TestCase):
 
         # test mask that covers the particle
         # and should override the one now attached to the job
-        df, scores = extract_particles(
+        _df, scores = extract_particles(
             job,
             100,
             particle_diameter=5,
@@ -965,7 +1007,7 @@ class TestTMJob(unittest.TestCase):
         # test extraction mask of int8 dtype:
         job = self.job.copy()
         job.tomogram_mask = TEST_EXTRACTION_MASK_INT8
-        df, scores = extract_particles(
+        _df, scores = extract_particles(
             job,
             100,
             particle_diameter=5,
@@ -999,7 +1041,7 @@ class TestTMJob(unittest.TestCase):
             )
 
         # Test exraction with tophat filter and plotting
-        df, scores = extract_particles(
+        _df, scores = extract_particles(
             job,
             100,
             particle_diameter=5,
@@ -1110,7 +1152,7 @@ class TestTMJob(unittest.TestCase):
         job.start_job(0, return_volumes=False)
 
         # repeat of relion5 extraction in extraction test above but with better center
-        df_rel5, scores = extract_particles(
+        df_rel5, _scores = extract_particles(
             job, 100, particle_diameter=10, create_plot=False, relion5_compat=True
         )
         binning = job.ts_metadata.binning
@@ -1129,7 +1171,7 @@ class TestTMJob(unittest.TestCase):
         job_metadata2 = job.ts_metadata.replace(binning=2.0)
         job_bin2.ts_metadata = job_metadata2
 
-        df_rel5, scores = extract_particles(
+        df_rel5, _scores = extract_particles(
             job_bin2, 100, particle_diameter=10, create_plot=False, relion5_compat=True
         )
         binning = job_bin2.ts_metadata.binning

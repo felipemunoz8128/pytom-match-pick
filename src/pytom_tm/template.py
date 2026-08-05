@@ -1,13 +1,14 @@
-import numpy.typing as npt
-import numpy as np
-import voltools as vt
 import logging
+
+import numpy as np
+import numpy.typing as npt
+import voltools as vt
+from scipy.fft import irfftn, rfftn
 from scipy.ndimage import center_of_mass, zoom
-from scipy.fft import rfftn, irfftn
-from pytom_tm.weights import (
-    create_gaussian_low_pass,
-    radial_reduced_grid,
-)
+
+from pytom_tm.weights import create_gaussian_low_pass
+
+logger = logging.getLogger(__name__)
 
 
 def generate_template_from_map(
@@ -63,7 +64,7 @@ def generate_template_from_map(
             f"Filter resolution is too low,"
             f" setting to {2 * output_spacing}A (2 * output voxel size)"
         )
-        logging.warning(warning_text)
+        logger.warning(warning_text)
         filter_to_resolution = 2 * output_spacing
 
     if center:
@@ -73,7 +74,7 @@ def generate_template_from_map(
         shift = np.subtract(volume_center, input_center_of_mass)
         input_map = vt.transform(input_map, translation=shift, device="cpu")
 
-        logging.debug(
+        logger.debug(
             f"center of mass, before was "
             f"{np.round(input_center_of_mass, 2)} "
             f"and after {np.round(center_of_mass(input_map**2), 2)}"
@@ -81,7 +82,7 @@ def generate_template_from_map(
 
     # extend volume to the desired output size before applying convolutions!
     if output_box_size is not None:
-        logging.debug(
+        logger.debug(
             f"size check {output_box_size} > "
             f"{(input_map.shape[0] * input_spacing) // output_spacing}"
         )
@@ -90,7 +91,7 @@ def generate_template_from_map(
                 int(output_box_size * (output_spacing / input_spacing))
                 - input_map.shape[0]
             )
-            logging.debug(f"pad with this number of zeros: {pad}")
+            logger.debug(f"pad with this number of zeros: {pad}")
             input_map = np.pad(
                 input_map,
                 (pad // 2, pad // 2 + pad % 2),
@@ -98,7 +99,7 @@ def generate_template_from_map(
                 constant_values=0,
             )
         elif output_box_size < (input_map.shape[0] * input_spacing) // output_spacing:
-            logging.warning(
+            logger.warning(
                 "Could not set specified box size as the map would need to be cut and "
                 "this might result in loss of information of the structure. Please "
                 "decrease the box size of the map by hand (e.g. chimera)"
@@ -109,44 +110,72 @@ def generate_template_from_map(
         input_map.shape, input_spacing, filter_to_resolution
     ).astype(np.float32)
 
-    logging.info("Convoluting volume with filter and then downsampling.")
+    logger.info("Convoluting volume with filter and then downsampling.")
     return zoom(
         irfftn(rfftn(input_map) * lpf, s=input_map.shape),
         input_spacing / output_spacing,
     )
 
 
-def phase_randomize_template(
+def _phase_randomize_template(
     template: npt.NDArray[float],
+    mask: npt.NDArray[float],
+    n_iter: int = 40,
     seed: int = 321,
-):
-    """Create a version of the template that has its phases randomly
-    permuted in Fourier space.
+) -> npt.NDArray[float]:
+    """Create a phase-randomized version of `template` that preserves its
+    amplitude spectrum.
+
+    Random phases are taken from the rfftn of a random real-valued field
+    instead of drawn independently per Fourier voxel. This guarantees they
+    satisfy Hermitian symmetry by construction, including at the
+    self-conjugate DC/Nyquist points, which independent (e.g. permuted)
+    phases would violate.
+
+    A Gerchberg-Saxton iteration alternates the amplitude constraint in
+    Fourier space with a real-space support constraint from `mask` for
+    `n_iter` iterations, so the resulting noise stays compact instead of
+    delocalizing over the full box.
 
     Parameters
     ----------
     template: npt.NDArray[float]
         input structure
+    mask: npt.NDArray[float]
+        real-space support constraint used in a Gerchberg-Saxton iteration;
+        same dimensions as template
+    n_iter: int, default 40
+        number of Gerchberg-Saxton iterations
     seed: int, default 321
-        seed for random number generator for phase permutation
+        seed for the random number generator
 
     Returns
     -------
     result: npt.NDArray[float]
         phase randomized version of the template
     """
-    ft = rfftn(template)
-    amplitude = np.abs(ft)
-
-    # permute the phases in flattened version of the array
-    phase = np.angle(ft).flatten()
-    grid = np.fft.ifftshift(radial_reduced_grid(template.shape), axes=(0, 1)).flatten()
-    relevant_freqs = grid <= 1  # permute only up to Nyquist
-    noise = np.zeros_like(phase)
     rng = np.random.default_rng(seed)
-    noise[relevant_freqs] = rng.permutation(phase[relevant_freqs])
+    t = np.asarray(template, dtype=np.float64)
+    # restrict to the signal that actually falls inside the mask, so the
+    # amplitude spectrum being matched doesn't include density the support
+    # constraint will discard anyway
+    t_eff = t * mask
+    amplitude = np.abs(rfftn(t_eff))
 
-    # construct the new template
-    noise = np.reshape(noise, amplitude.shape)
-    result = irfftn(amplitude * np.exp(1j * noise), s=template.shape)
-    return result
+    # Hermitian-valid random phases: phases of the rfftn of a random real field
+    phase = np.angle(rfftn(rng.standard_normal(t.shape)))
+    result = irfftn(amplitude * np.exp(1j * phase), s=t.shape)
+
+    for _ in range(n_iter):
+        result = result * mask
+        phase = np.angle(rfftn(result))
+        result = irfftn(amplitude * np.exp(1j * phase), s=t.shape)
+    result = result * mask
+
+    # the GS loop only fixes |amplitude|, so without this, result is identical for
+    # t and -t; this restores equivariance with t's sign, keeping the noise
+    # template's contrast convention consistent with the real template's
+    if np.sign(result.sum()) != np.sign(t_eff.sum()):
+        result = -result
+
+    return result.astype(np.float32)

@@ -1,21 +1,22 @@
-import unittest
-import pathlib
-import warnings
 import contextlib
+import pathlib
+import unittest
+import warnings
 from tempfile import TemporaryDirectory
-import numpy as np
+
 import mrcfile
+import numpy as np
 from lxml import etree
 
 from pytom_tm.dataclass import CtfData, RelionTiltSeriesMetaData
 from pytom_tm.io import (
-    read_mrc,
-    read_mrc_meta_data,
-    write_mrc,
+    MultiColumnAngleFileError,
     parse_relion5_star_data,
     parse_warp_xml_data,
+    read_mrc,
+    read_mrc_meta_data,
     read_tlt_file,
-    MultiColumnAngleFileError,
+    write_mrc,
 )
 
 FAILING_MRC = pathlib.Path(__file__).parent.joinpath(
@@ -67,12 +68,19 @@ class TestWarpXMLParser(unittest.TestCase):
     def test_correct_defocus_units(self):
         # prevent issue 325 by testing if all defocus values are sane
         # (between 100 and 0.1 μm)
-        voxel_size, ts_metadata = parse_warp_xml_data(WARP_XML, TEST_TOMOGRAM)
+        _voxel_size, ts_metadata = parse_warp_xml_data(WARP_XML, TEST_TOMOGRAM)
         for ctf in ts_metadata.ctf_data:
             self.assertTrue(10e-6 >= ctf.defocus >= 0.1e-6)
 
+    def test_phase_flip_default_on(self):
+        # warp/AreTomo reconstructions are always CTF-corrected, so phase flip
+        # correction should default to on for warp metadata
+        _voxel_size, ts_metadata = parse_warp_xml_data(WARP_XML, TEST_TOMOGRAM)
+        for ctf in ts_metadata.ctf_data:
+            self.assertTrue(ctf.flip_phase)
+
     def test_correct_angle_sign(self):
-        voxel_size, ts_metadata = parse_warp_xml_data(WARP_XML, TEST_TOMOGRAM)
+        _voxel_size, ts_metadata = parse_warp_xml_data(WARP_XML, TEST_TOMOGRAM)
         # grab raw xml data
         tree = etree.parse(WARP_XML)
         tilt_angle_nodes = tree.findall(".//Angles")
@@ -84,6 +92,51 @@ class TestWarpXMLParser(unittest.TestCase):
         ]
         for a, b in zip(ts_metadata.tilt_angles, angles):
             self.assertEqual(a, -b)
+
+    def test_level_angles_default_to_zero(self):
+        # the fixture xml predates LevelAngleX/LevelAngleY, so they should default
+        # to 0.0 instead of raising
+        _, ts_metadata = parse_warp_xml_data(WARP_XML, TEST_TOMOGRAM)
+        self.assertEqual(ts_metadata.level_angle_x, 0.0)
+        self.assertEqual(ts_metadata.level_angle_y, 0.0)
+
+    def test_level_angle_sign(self):
+        # LevelAngleY is negated the same way tilt angles are, to swap from warp's
+        # internal convention to pytom's (see PR #334). LevelAngleX is kept as-is:
+        # it composes as a separate rotation about a different axis than the tilt
+        # angle, so it does not follow the same sign convention (verified against
+        # a real WarpTools reconstruction via warpylib)
+        raw_xml = WARP_XML.read_text(encoding="utf-8-sig")
+        raw_xml = raw_xml.replace(
+            'AreAnglesInverted="False"',
+            'AreAnglesInverted="False" LevelAngleX="1.5" LevelAngleY="3.2"',
+            1,
+        )
+        with TemporaryDirectory() as tmp_dir:
+            level_angle_xml = pathlib.Path(tmp_dir).joinpath("level_angle.xml")
+            level_angle_xml.write_text(raw_xml, encoding="utf-8")
+            _, ts_metadata = parse_warp_xml_data(level_angle_xml, TEST_TOMOGRAM)
+        self.assertEqual(ts_metadata.level_angle_x, 1.5)
+        # Warp tilt angles are inverted on loading to match our convention
+        self.assertEqual(ts_metadata.level_angle_y, -3.2)
+
+    def test_defocus_handedness_default(self):
+        # the fixture xml has AreAnglesInverted="False", which should give the
+        # default WarpTools defocus handedness of -1
+        _, ts_metadata = parse_warp_xml_data(WARP_XML, TEST_TOMOGRAM)
+        self.assertEqual(ts_metadata.defocus_handedness, -1)
+
+    def test_defocus_handedness_inverted(self):
+        # AreAnglesInverted="True" should flip the defocus handedness to 1
+        raw_xml = WARP_XML.read_text(encoding="utf-8-sig")
+        raw_xml = raw_xml.replace(
+            'AreAnglesInverted="False"', 'AreAnglesInverted="True"', 1
+        )
+        with TemporaryDirectory() as tmp_dir:
+            inverted_xml = pathlib.Path(tmp_dir).joinpath("inverted.xml")
+            inverted_xml.write_text(raw_xml, encoding="utf-8")
+            _, ts_metadata = parse_warp_xml_data(inverted_xml, TEST_TOMOGRAM)
+        self.assertEqual(ts_metadata.defocus_handedness, 1)
 
 
 class TestBrokenMRC(unittest.TestCase):
@@ -105,7 +158,7 @@ class TestBrokenMRC(unittest.TestCase):
 
     def test_read_mrc_minor_broken(self):
         # Test if this mrc can be read and if the approriate logs are printed
-        with self.assertLogs(level="WARNING") as cm:
+        with self.assertLogs(logger="pytom_tm", level="WARNING") as cm:
             mrc = read_mrc(FAILING_MRC)
         self.assertIsNotNone(mrc)
         self.assertEqual(len(cm.output), 1)
@@ -121,7 +174,7 @@ class TestBrokenMRC(unittest.TestCase):
 
     def test_read_mrc_meta_data(self):
         # Test if this mrc can be read and if the approriate logs are printed
-        with self.assertLogs(level="WARNING") as cm:
+        with self.assertLogs(logger="pytom_tm", level="WARNING") as cm:
             mrc = read_mrc_meta_data(FAILING_MRC)
         self.assertIsNotNone(mrc)
         self.assertEqual(len(cm.output), 1)
@@ -132,7 +185,7 @@ class TestBrokenMRC(unittest.TestCase):
         array = np.random.rand(27).reshape((3, 3, 3)).astype(np.float16)
         fname = pathlib.Path(self.tempdirname) / "test_half.mrc"
         # Make sure no warnings are raised
-        with self.assertNoLogs(level="WARNING"):
+        with self.assertNoLogs(logger="pytom_tm", level="WARNING"):
             write_mrc(fname, array, 1.0)
         # Make sure the file can be read back
         # make sure mode is as expected for float16
@@ -150,10 +203,24 @@ class TestBrokenMRC(unittest.TestCase):
         # make sure a warning is raised when writing an integer based array
         array = np.random.rand(27).reshape((3, 3, 3)).astype(np.int32)
         fname = pathlib.Path(self.tempdirname) / "test_cast.mrc"
-        with self.assertLogs(level="WARNING") as cm:
+        with self.assertLogs(logger="pytom_tm", level="WARNING") as cm:
             write_mrc(fname, array, 1.0)
         self.assertEqual(len(cm.output), 1)
         self.assertIn("np.float32", cm.output[0])
+
+    def test_almost_equal_voxel_warning(self):
+        array = np.random.rand(27).reshape((3, 3, 3)).astype(np.float32)
+        fname = pathlib.Path(self.tempdirname) / "test_almost_equal_voxels.mrc"
+        # Make sure no warnings are raised
+        with self.assertNoLogs(logger="pytom_tm", level="WARNING"):
+            write_mrc(fname, array, voxel_size=(1.0, 1.0, 1.0001))
+        # Make sure a warning is raised when reading
+        with self.assertLogs(logger="pytom_tm", level="WARNING") as cm:
+            _ = read_mrc_meta_data(fname)
+        self.assertEqual(len(cm.output), 1)
+        self.assertIn(
+            "Voxel size annotation in MRC is slightly different", cm.output[0]
+        )
 
     def test_parse_relion5_star_data(self):
         tomogram = pathlib.Path("rec_tomo200528_107.mrc")
